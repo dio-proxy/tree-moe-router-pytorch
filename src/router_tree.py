@@ -4,7 +4,12 @@ Routing is factorised into two decisions:
 
 1. **Level 1 (cluster):** ``P(c | x) = softmax(W_c x)`` over ``num_clusters`` clusters,
    and each token is sent to its arg-max cluster ``c*``.
-2. **Level 2 (expert):** TODO - pick an expert inside the selected cluster.
+2. **Level 2 (expert):** ``P(e | x, c*) = softmax(W_e^{(c*)} x)`` over the
+   ``experts_per_cluster`` experts of the selected cluster only, and each token is
+   sent to its arg-max expert ``e*``.
+
+The combined gate value is ``P(c* | x) * P(e* | x, c*)`` and the flat (global) expert
+id is ``c* * experts_per_cluster + e*``.
 """
 
 from __future__ import annotations
@@ -43,21 +48,45 @@ class TreeRouter(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Route each token to one cluster (level 1 only for now).
+        """Route each token to one global expert.
 
         Args:
             x: Token representations of shape ``[..., hidden_dim]``.
 
         Returns:
-            ``(cluster_indices, cluster_weights)``, both of shape ``[...]``.
+            A tuple ``(global_expert_indices, routing_weights)`` where
+
+            * ``global_expert_indices``: int64 tensor of shape ``[...]`` with values in
+              ``[0, num_clusters * experts_per_cluster - 1]``.
+            * ``routing_weights``: tensor of shape ``[...]`` holding
+              ``P(cluster) * P(expert | cluster)`` for the selected path (differentiable).
         """
         leading_shape = x.shape[:-1]
         tokens = x.reshape(-1, self.hidden_dim)
+        num_tokens = tokens.shape[0]
 
-        cluster_probs = F.softmax(self.cluster_gate(tokens), dim=-1)  # [T, C]
-        cluster_weight, cluster_idx = cluster_probs.max(dim=-1)
+        # ---- Level 1: cluster routing (softmax in fp32 for numerical stability) ----
+        cluster_probs = F.softmax(self.cluster_gate(tokens).float(), dim=-1)  # [T, C]
+        cluster_weight, cluster_idx = cluster_probs.max(dim=-1)  # [T], [T]
 
-        return cluster_idx.reshape(leading_shape), cluster_weight.reshape(leading_shape)
+        # ---- Level 2: expert routing within the selected cluster ----
+        expert_weight = cluster_probs.new_zeros(num_tokens)
+        local_expert_idx = torch.zeros(num_tokens, dtype=torch.long, device=x.device)
+
+        for c, gate in enumerate(self.expert_gates):
+            token_ids = torch.nonzero(cluster_idx == c, as_tuple=True)[0]
+            if token_ids.numel() == 0:
+                continue
+            probs_c = F.softmax(gate(tokens[token_ids]).float(), dim=-1)  # [T_c, E]
+            weight_c, idx_c = probs_c.max(dim=-1)
+            expert_weight = expert_weight.index_put((token_ids,), weight_c)
+            local_expert_idx[token_ids] = idx_c
+
+        # ---- Combine: P(final expert) = P(cluster) * P(expert | cluster) ----
+        routing_weights = (cluster_weight * expert_weight).to(x.dtype)
+        global_expert_indices = cluster_idx * self.experts_per_cluster + local_expert_idx
+
+        return global_expert_indices.reshape(leading_shape), routing_weights.reshape(leading_shape)
 
     def extra_repr(self) -> str:
         """Readable summary shown by ``print(module)``."""
