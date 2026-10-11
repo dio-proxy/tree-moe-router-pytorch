@@ -1,7 +1,7 @@
 """Hierarchical (tree) Mixture-of-Experts routing in PyTorch."""
 
 from .experts import Expert
-from .router_tree import TreeRouter
+from .router_tree import TreeRouter, load_balancing_loss
 
-__all__ = ["Expert", "TreeRouter"]
+__all__ = ["Expert", "TreeRouter", "load_balancing_loss"]
 __version__ = "0.1.0"
